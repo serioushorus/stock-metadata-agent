@@ -17,8 +17,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, field_validator
 
+from stock_metadata_agent.geocoding import ReverseGeocodeResult, reverse_geocode_location
 from generate_stock_metadata import (
-    EDITORIAL_DESCRIPTION_PATTERN,
     Metadata,
     build_adobe_category_map,
     load_csv_header,
@@ -80,6 +80,8 @@ class WorkflowState(TypedDict, total=False):
     overwrite_metadata: bool
     overwrite_csv: bool
     update_ledger: bool
+    reverse_geocode_editorial: bool
+    reverse_geocode_cache: str
     authority_context: dict[str, object]
     processed: list[str]
     pending_images: list[str]
@@ -254,6 +256,8 @@ def draft_to_metadata(
     image_path: Path,
     exif: dict[str, object],
     authority_context: dict[str, object],
+    reverse_geocode_editorial: bool,
+    reverse_geocode_cache: Path,
 ) -> Metadata:
     created_date = normalise_created_date(draft.created_date or str(exif.get("created_at", "")))
     meta = Metadata(
@@ -272,7 +276,7 @@ def draft_to_metadata(
         notes=draft.notes.strip(),
     )
     meta = normalise_provider_categories(meta, authority_context)
-    return normalise_editorial_metadata(meta, exif)
+    return normalise_editorial_metadata(meta, exif, reverse_geocode_editorial, reverse_geocode_cache)
 
 
 def infer_shutterstock_categories(meta: Metadata) -> list[str]:
@@ -360,13 +364,70 @@ def created_date_to_dateline_date(created_date: str) -> str:
     return f"{month_names[month]} {int(match.group(3))}, {match.group(1)}"
 
 
-def infer_city_for_dateline(meta: Metadata, exif: dict[str, object]) -> str:
+def is_placeholder(value: str) -> bool:
+    return bool(re.fullmatch(r"\[[^\]]+\]", value.strip()))
+
+
+def coerce_float(value: object) -> float | None:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def get_reverse_geocode_for_editorial(
+    exif: dict[str, object],
+    enabled: bool,
+    cache_path: Path,
+) -> ReverseGeocodeResult | None:
+    if not enabled:
+        return None
+    latitude = coerce_float(exif.get("latitude"))
+    longitude = coerce_float(exif.get("longitude"))
+    if latitude is None or longitude is None:
+        return None
+
+    result = reverse_geocode_location(latitude, longitude, cache_path)
+    if result:
+        exif.setdefault("city_guess", result.city)
+        exif.setdefault("state_guess", result.state)
+        exif.setdefault("reverse_geocode_country", result.country)
+        exif.setdefault("reverse_geocode_source", result.source)
+    return result
+
+
+def infer_city_for_dateline(
+    meta: Metadata,
+    exif: dict[str, object],
+    reverse_geocode: ReverseGeocodeResult | None,
+) -> str:
     combined = " ".join([meta.title, meta.description, " ".join(meta.keywords)]).lower()
     if "bangkok" in combined:
         return "Bangkok"
     if exif.get("country_guess") == "Thailand" and "wat arun" in combined:
         return "Bangkok"
+    city_guess = str(exif.get("city_guess", "")).strip()
+    if city_guess:
+        return city_guess
+    if reverse_geocode and reverse_geocode.city:
+        return reverse_geocode.city
     return "[City]"
+
+
+def parse_editorial_dateline(description: str) -> tuple[str, str, str, str] | None:
+    match = re.match(
+        r"^(?P<city>\[[^\]]+\]|[^,:]+), (?P<country>\[[^\]]+\]|[^:]+?) - "
+        r"(?P<date>\[[^\]]+\]|[A-Z][a-z]+ \d{1,2}, \d{4}): (?P<sentence>.+\S)$",
+        description.strip(),
+    )
+    if not match:
+        return None
+    return (
+        match.group("city").strip(),
+        match.group("country").strip(),
+        match.group("date").strip(),
+        match.group("sentence").strip(),
+    )
 
 
 def strip_existing_dateline(description: str) -> str:
@@ -378,14 +439,31 @@ def strip_existing_dateline(description: str) -> str:
     return value or description.strip()
 
 
-def normalise_editorial_metadata(meta: Metadata, exif: dict[str, object]) -> Metadata:
-    if meta.editorial != "yes" or EDITORIAL_DESCRIPTION_PATTERN.fullmatch(meta.description):
+def normalise_editorial_metadata(
+    meta: Metadata,
+    exif: dict[str, object],
+    reverse_geocode_editorial: bool,
+    reverse_geocode_cache: Path,
+) -> Metadata:
+    if meta.editorial != "yes":
         return meta
 
-    city = infer_city_for_dateline(meta, exif)
-    country = meta.country or str(exif.get("country_guess", "")).strip() or "[Country]"
-    date_text = created_date_to_dateline_date(meta.created_date)
-    factual_sentence = strip_existing_dateline(meta.description)
+    existing = parse_editorial_dateline(meta.description)
+    existing_city = existing[0] if existing else ""
+    existing_country = existing[1] if existing else ""
+    reverse_geocode = get_reverse_geocode_for_editorial(exif, reverse_geocode_editorial, reverse_geocode_cache)
+
+    city = existing_city if existing_city and not is_placeholder(existing_city) else infer_city_for_dateline(meta, exif, reverse_geocode)
+    country = (
+        existing_country
+        if existing_country and not is_placeholder(existing_country)
+        else meta.country
+        or str(exif.get("country_guess", "")).strip()
+        or (reverse_geocode.country if reverse_geocode else "")
+        or "[Country]"
+    )
+    date_text = existing[2] if existing and not is_placeholder(existing[2]) else created_date_to_dateline_date(meta.created_date)
+    factual_sentence = existing[3] if existing else strip_existing_dateline(meta.description)
     description = f"{city}, {country} - {date_text}: {factual_sentence}"
     return Metadata(**{**meta.__dict__, "description": description})
 
@@ -422,7 +500,14 @@ def review_image_with_openai(state: WorkflowState) -> WorkflowState:
     if draft.filename != image_path.name:
         raise ValueError(f"OpenAI returned filename {draft.filename!r}, expected {image_path.name!r}.")
 
-    meta = draft_to_metadata(draft, image_path, exif, state["authority_context"])
+    meta = draft_to_metadata(
+        draft,
+        image_path,
+        exif,
+        state["authority_context"],
+        state.get("reverse_geocode_editorial", True),
+        Path(state["reverse_geocode_cache"]),
+    )
     write_metadata_file(md_path, metadata_to_markdown(meta), overwrite=True)
     parse_metadata_file(md_path)
     written = list(state.get("written_markdown", [])) + [str(md_path)]
@@ -529,6 +614,11 @@ def parse_args(default_model: str) -> argparse.Namespace:
     parser.add_argument("--overwrite-metadata", action="store_true")
     parser.add_argument("--overwrite-csv", action="store_true")
     parser.add_argument("--no-update-ledger", action="store_true")
+    parser.add_argument(
+        "--no-reverse-geocode",
+        action="store_true",
+        help="Disable automatic GPS reverse geocoding for editorial datelines.",
+    )
     return parser.parse_args()
 
 
@@ -540,6 +630,7 @@ def main() -> int:
     image_dir = (root / args.image_dir).resolve()
     metadata_dir = (root / (args.metadata_dir or args.image_dir)).resolve()
     output_dir = (root / (args.output_dir or args.image_dir)).resolve()
+    reverse_geocode_cache = root / ".cache" / "reverse_geocode_cache.json"
     final_state = build_graph().invoke(
         {
             "root": str(root),
@@ -552,6 +643,8 @@ def main() -> int:
             "overwrite_metadata": args.overwrite_metadata,
             "overwrite_csv": args.overwrite_csv,
             "update_ledger": not args.no_update_ledger,
+            "reverse_geocode_editorial": not args.no_reverse_geocode,
+            "reverse_geocode_cache": str(reverse_geocode_cache),
         }
     )
     print(f"metadata written: {len(final_state.get('written_markdown', []))}")

@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .pyinaturalist_cache/
+.cache/
 
 # Local photo batches and generated exports
 260*/

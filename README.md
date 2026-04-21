@@ -35,6 +35,15 @@ To reprocess files already listed in `processed_photos.txt`:
 python stock_metadata_agent\workflow.py path\to\image_batch --include-processed --overwrite-metadata --overwrite-csv
 ```
 
+When an image is classified as editorial and EXIF GPS is available, the workflow
+automatically reverse-geocodes the coordinates to fill the dateline city when
+needed. Results are cached in `.cache\reverse_geocode_cache.json`. To disable
+network reverse geocoding:
+
+```powershell
+python stock_metadata_agent\workflow.py path\to\image_batch --no-reverse-geocode
+```
+
 ## Validation And Export Only
 
 The exporter can rebuild CSVs from existing metadata markdown:
