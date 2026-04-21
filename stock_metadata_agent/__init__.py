@@ -1,0 +1,1 @@
+"""Stock metadata workflow package."""

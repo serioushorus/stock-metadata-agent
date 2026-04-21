@@ -1,0 +1,7 @@
+openai
+pillow
+pyinaturalist
+langchain
+langchain-openai
+langgraph
+pydantic

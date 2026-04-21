@@ -1,0 +1,19 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyinaturalist_cache/
+
+# Local photo batches and generated exports
+260*/
+*_workflow_test*/
+*.jpg
+*.jpeg
+*.png
+*.webp
+shutterstock_upload_generated.csv
+adobe_stock_upload_generated.csv
+istock_metadata_generated.csv
+.stock_metadata_exif_context.json

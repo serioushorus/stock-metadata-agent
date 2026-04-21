@@ -1,0 +1,17 @@
+[project]
+name = "stock-metadata-agent"
+version = "0.1.0"
+description = "Generate stock-photo metadata markdown and CSV exports."
+requires-python = ">=3.11"
+dependencies = [
+  "openai",
+  "pillow",
+  "pyinaturalist",
+  "langchain",
+  "langchain-openai",
+  "langgraph",
+  "pydantic",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
