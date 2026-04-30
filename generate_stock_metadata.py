@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 """
-Read per-image metadata markdown files, enrich them with pyinaturalist taxon
-validation, and export provider-specific CSV files.
+Read per-image metadata markdown files and export provider-specific CSV files.
 
 Workflow:
 1. Read existing metadata .md files.
-2. Validate and, when possible, enrich taxon candidates using pyinaturalist.
-3. Export:
+2. Export:
    - Shutterstock CSV
    - Adobe Stock CSV
 
 Notes:
-    Taxon candidates are read from `Notes` entries prefixed with `Taxon candidate:`.
+    Species names and common names must already be present in the reviewed markdown
+    when visually supported. This exporter does not call external taxonomy APIs.
 
 Typical usage:
     python generate_stock_metadata.py 260327
 
-Requirements:
-    pip install pyinaturalist
-
 Environment:
 Optional:
     A local .env file in the project root is loaded automatically.
-    pyinaturalist is optional but enables taxon validation for animal and plant subjects.
 """
 
 from __future__ import annotations
@@ -43,15 +38,6 @@ except ImportError:  # pragma: no cover - validated at runtime
     Image = None  # type: ignore[assignment]
     GPSTAGS = {}  # type: ignore[assignment]
     TAGS = {}  # type: ignore[assignment]
-
-try:
-    from pyinaturalist import ClientSession
-    from pyinaturalist.v1.taxa import get_taxa, get_taxa_autocomplete
-except ImportError:  # pragma: no cover - validated at runtime
-    ClientSession = None  # type: ignore[assignment]
-    get_taxa = None  # type: ignore[assignment]
-    get_taxa_autocomplete = None  # type: ignore[assignment]
-
 
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -102,8 +88,8 @@ class Metadata:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read existing metadata markdown files, enrich them with pyinaturalist, "
-            "and build Shutterstock and Adobe CSV exports from those markdown files."
+            "Read existing metadata markdown files and build Shutterstock, Adobe, "
+            "and iStock CSV exports from those markdown files."
         )
     )
     parser.add_argument("image_dir", help="Directory containing image files.")
@@ -119,12 +105,6 @@ def parse_args() -> argparse.Namespace:
         "--overwrite-csv",
         action="store_true",
         help="Overwrite existing CSV files.",
-    )
-    parser.add_argument(
-        "--max-keywords",
-        type=int,
-        default=49,
-        help="Maximum number of keywords to keep when rewriting enriched metadata.",
     )
     parser.add_argument(
         "--extensions",
@@ -179,163 +159,6 @@ def normalize_keywords(keywords: Iterable[str], max_keywords: int) -> list[str]:
         if len(cleaned) >= max_keywords:
             break
     return cleaned
-
-
-def normalize_taxon_candidate(candidate: str) -> str:
-    candidate = re.sub(r"\([^)]*\)", " ", candidate)
-    return re.sub(r"\s+", " ", candidate.strip(" .;:,"))
-
-
-def get_pyinaturalist_session() -> object | None:
-    if ClientSession is None:
-        return None
-
-    cache_root = Path(
-        os.environ.get("PYINATURALIST_CACHE_DIR", Path.cwd() / ".pyinaturalist_cache")
-    ).expanduser()
-    cache_root.mkdir(parents=True, exist_ok=True)
-    return ClientSession(
-        cache_file=str(cache_root / "api_requests.db"),
-        ratelimit_path=str(cache_root / "api_ratelimit.db"),
-        lock_path=str(cache_root / "api_ratelimit.lock"),
-    )
-
-
-def validate_taxon_candidate(candidate: str) -> dict | None:
-    if not candidate:
-        return None
-    session = get_pyinaturalist_session()
-    if get_taxa_autocomplete is None or session is None:
-        return None
-
-    query = normalize_taxon_candidate(candidate)
-    def search(**params: object) -> list[dict]:
-        try:
-            response = get_taxa_autocomplete(session=session, **params)
-        except Exception:
-            return []
-        return list(response.get("results") or [])
-
-    results = search(q=query, is_active=True)
-    if not results and " " in query and get_taxa is not None:
-        first_token = query.split()[0]
-        try:
-            response = get_taxa(
-                q=first_token,
-                all_names=True,
-                is_active=True,
-                per_page=10,
-                session=session,
-            )
-            results = list(response.get("results") or [])
-        except Exception:
-            results = []
-
-    if not results:
-        return None
-
-    query_lc = query.lower()
-    for result in results:
-        name = str(result.get("name", "")).strip()
-        matched_term = str(result.get("matched_term", "")).strip()
-        common_name = str(result.get("preferred_common_name", "")).strip()
-        if (
-            name.lower() == query_lc
-            or matched_term.lower() == query_lc
-            or common_name.lower() == query_lc
-        ):
-            return result
-
-    return None
-
-
-def choose_taxon_result(
-    taxon_candidate: str,
-    validated_candidate: dict | None,
-) -> tuple[dict | None, str]:
-    if validated_candidate:
-        candidate_name = str((validated_candidate or {}).get("name", taxon_candidate)).strip()
-        taxon_rank = str((validated_candidate or {}).get("rank", "")).strip().lower()
-        return validated_candidate, f"Taxon validated with pyinaturalist: {candidate_name} ({taxon_rank})."
-    return None, ""
-
-
-def get_taxon_candidate(meta: Metadata) -> str:
-    note_match = re.search(
-        r"taxon candidate\s*:\s*(.+?)(?=\.\s|;\s| taxon validated\b| taxon candidate not confirmed\b| pyinaturalist unavailable\b|$)",
-        meta.notes,
-        re.IGNORECASE,
-    )
-    if note_match:
-        return normalize_taxon_candidate(note_match.group(1))
-
-    return ""
-
-
-def enrich_metadata_with_taxon(meta: Metadata, max_keywords: int) -> Metadata:
-    candidate = get_taxon_candidate(meta)
-    if not candidate:
-        return meta
-    if get_taxa_autocomplete is None:
-        notes = meta.notes
-        if "pyinaturalist unavailable; taxon validation skipped." not in notes:
-            notes = f"{notes} pyinaturalist unavailable; taxon validation skipped.".strip()
-        return Metadata(
-            filename=meta.filename,
-            created_date=meta.created_date,
-            country=meta.country,
-            title=meta.title,
-            description=meta.description,
-            keywords=meta.keywords,
-            shutterstock_categories=meta.shutterstock_categories,
-            adobe_category=meta.adobe_category,
-            editorial=meta.editorial,
-            mature_content=meta.mature_content,
-            illustration=meta.illustration,
-            releases=meta.releases,
-            notes=notes,
-        )
-
-    validated_candidate = validate_taxon_candidate(candidate)
-    taxon_result, taxon_validation_note = choose_taxon_result(candidate, validated_candidate)
-    if not taxon_result:
-        if candidate and "Taxon candidate not confirmed:" not in meta.notes:
-            note = f"{meta.notes} Taxon candidate not confirmed: {candidate}."
-            return Metadata(**{**meta.__dict__, "notes": note.strip()})
-        return meta
-
-    taxon_name = str(taxon_result.get("name", "")).strip()
-    taxon_rank = str(taxon_result.get("rank", "")).strip().lower()
-    common_name = str(taxon_result.get("preferred_common_name", "")).strip()
-    if common_name and common_name.lower() not in {kw.lower() for kw in meta.keywords}:
-        keyword_candidates = [common_name] + meta.keywords
-    else:
-        keyword_candidates = list(meta.keywords)
-    if taxon_name and taxon_name.lower() not in {kw.lower() for kw in keyword_candidates}:
-        if taxon_rank in {"species", "subspecies"}:
-            keyword_candidates = [taxon_name] + keyword_candidates
-        elif taxon_rank in {"genus", "family"}:
-            keyword_candidates = keyword_candidates + [taxon_name]
-
-    notes = meta.notes
-    if taxon_validation_note and taxon_validation_note not in notes:
-        notes = f"{notes} {taxon_validation_note}".strip()
-
-    return Metadata(
-        filename=meta.filename,
-        created_date=meta.created_date,
-        country=meta.country,
-        title=meta.title,
-        description=meta.description,
-        keywords=normalize_keywords(keyword_candidates, max_keywords),
-        shutterstock_categories=meta.shutterstock_categories,
-        adobe_category=meta.adobe_category,
-        editorial=meta.editorial,
-        mature_content=meta.mature_content,
-        illustration=meta.illustration,
-        releases=meta.releases,
-        notes=notes,
-    )
 
 
 def metadata_to_markdown(meta: Metadata) -> str:
@@ -631,9 +454,8 @@ def build_csvs_from_metadata(
     adobe_category_map: dict[str, int],
     istock_header: list[str],
     extensions: set[str],
-    max_keywords: int,
     overwrite_csv: bool,
-) -> tuple[Path, Path, Path, int]:
+) -> tuple[Path, Path, Path, Path, Path, int]:
     items: list[Metadata] = []
     source_filenames = {
         path.name
@@ -649,8 +471,7 @@ def build_csvs_from_metadata(
         source_name = source_stems.get(md_path.stem.lower())
         if not source_name:
             continue
-        item = enrich_metadata_with_taxon(parse_metadata_file(md_path), max_keywords=max_keywords)
-        write_metadata_file(md_path, metadata_to_markdown(item), overwrite=True)
+        item = parse_metadata_file(md_path)
         if item.filename != source_name:
             raise ValueError(
                 f"{md_path.name}: Filename field {item.filename!r} does not match source image {source_name!r}"
@@ -672,10 +493,16 @@ def build_csvs_from_metadata(
     shutterstock_csv = output_dir / "shutterstock_upload_generated.csv"
     adobe_csv = output_dir / "adobe_stock_upload_generated.csv"
     istock_csv = output_dir / "istock_metadata_generated.csv"
+    istock_commercial_csv = output_dir / "istock_metadata_commercial_generated.csv"
+    istock_editorial_csv = output_dir / "istock_metadata_editorial_generated.csv"
+    commercial_items = [item for item in items if item.editorial == "no"]
+    editorial_items = [item for item in items if item.editorial == "yes"]
     write_shutterstock_csv(shutterstock_csv, items, overwrite_csv)
     write_adobe_csv(adobe_csv, items, adobe_category_map, overwrite_csv)
     write_istock_csv(istock_csv, items, istock_header, overwrite_csv)
-    return shutterstock_csv, adobe_csv, istock_csv, len(items)
+    write_istock_csv(istock_commercial_csv, commercial_items, istock_header, overwrite_csv)
+    write_istock_csv(istock_editorial_csv, editorial_items, istock_header, overwrite_csv)
+    return shutterstock_csv, adobe_csv, istock_csv, istock_commercial_csv, istock_editorial_csv, len(items)
 
 
 def main() -> int:
@@ -692,7 +519,7 @@ def main() -> int:
     adobe_category_map = build_adobe_category_map(adobe_categories)
     istock_header = load_csv_header(root / "iStockMetadataTemplate.csv")
 
-    shutterstock_csv, adobe_csv, istock_csv, count = build_csvs_from_metadata(
+    shutterstock_csv, adobe_csv, istock_csv, istock_commercial_csv, istock_editorial_csv, count = build_csvs_from_metadata(
         image_dir=image_dir,
         metadata_dir=metadata_dir,
         output_dir=output_dir,
@@ -701,13 +528,14 @@ def main() -> int:
         adobe_category_map=adobe_category_map,
         istock_header=istock_header,
         extensions={ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in args.extensions},
-        max_keywords=args.max_keywords,
         overwrite_csv=args.overwrite_csv,
     )
     print(f"generated {count} metadata files into CSV exports")
     print(f"shutterstock csv: {shutterstock_csv}")
     print(f"adobe csv: {adobe_csv}")
     print(f"istock csv: {istock_csv}")
+    print(f"istock commercial csv: {istock_commercial_csv}")
+    print(f"istock editorial csv: {istock_editorial_csv}")
     return 0
 
 

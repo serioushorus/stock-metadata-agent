@@ -17,4 +17,6 @@ __pycache__/
 shutterstock_upload_generated.csv
 adobe_stock_upload_generated.csv
 istock_metadata_generated.csv
+istock_metadata_commercial_generated.csv
+istock_metadata_editorial_generated.csv
 .stock_metadata_exif_context.json

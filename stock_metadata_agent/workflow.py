@@ -39,6 +39,7 @@ HELPER_NAME_PATTERNS = (
     "istock_metadata_generated",
 )
 EXIF_SCRIPT = Path(__file__).resolve().parent / "scripts" / "extract_exif_context.py"
+REVIEW_QUEUE_NAME = ".stock_metadata_review_queue.json"
 
 
 class MetadataDraft(BaseModel):
@@ -75,6 +76,7 @@ class WorkflowState(TypedDict, total=False):
     metadata_dir: str
     output_dir: str
     model: str
+    review_mode: Literal["openai", "codex"]
     max_images: int | None
     include_processed: bool
     overwrite_metadata: bool
@@ -90,6 +92,8 @@ class WorkflowState(TypedDict, total=False):
     written_markdown: list[str]
     skipped_existing: list[str]
     exported_csvs: list[str]
+    codex_review_queue: list[dict[str, object]]
+    codex_review_queue_path: str
 
 
 def load_dotenv(path: Path) -> None:
@@ -163,6 +167,7 @@ def prepare_workspace(state: WorkflowState) -> WorkflowState:
         "written_markdown": [],
         "skipped_existing": [],
         "exported_csvs": [],
+        "codex_review_queue": [],
     }
 
 
@@ -191,7 +196,11 @@ def select_next_image(state: WorkflowState) -> WorkflowState:
 
 
 def should_review_or_export(state: WorkflowState) -> str:
-    return "export" if not state.get("current_image") else "review"
+    if state.get("current_image"):
+        return "review"
+    if state.get("review_mode") == "codex" and state.get("codex_review_queue"):
+        return "write_codex_queue"
+    return "export"
 
 
 def image_to_data_url(path: Path) -> str:
@@ -237,7 +246,8 @@ Follow these hard rules:
 - Use one Adobe category, exactly from the allowed list.
 - Keep Mature content and Illustration as no unless the visible image clearly requires otherwise.
 - Leave Releases blank unless the user has provided known release names.
-- Add "Taxon candidate: ..." in notes only for a plausible plant or animal ID that should be validated later.
+- For plant or animal subjects, include scientific or common names only when the image review supports them.
+- If a species-level ID is uncertain, keep wording at genus, family, or generic subject level and note the uncertainty plainly.
 
 EXIF context:
 {json.dumps(exif, ensure_ascii=False, indent=2)}
@@ -514,6 +524,67 @@ def review_image_with_openai(state: WorkflowState) -> WorkflowState:
     return {**state, "written_markdown": written}
 
 
+def build_codex_review_item(
+    image_path: Path,
+    md_path: Path,
+    exif: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "filename": image_path.name,
+        "image_path": str(image_path.resolve()),
+        "metadata_path": str(md_path.resolve()),
+        "exif": exif,
+        "status": "needs_review",
+    }
+
+
+def review_image_with_codex(state: WorkflowState) -> WorkflowState:
+    image_path = Path(state["current_image"])
+    metadata_dir = Path(state["metadata_dir"]).resolve()
+    md_path = metadata_dir / f"{image_path.stem}.md"
+    if md_path.exists() and not state.get("overwrite_metadata", False):
+        item = parse_metadata_file(md_path)
+        if item.filename != image_path.name:
+            raise ValueError(f"Metadata {md_path} has filename {item.filename!r}, expected {image_path.name!r}.")
+        skipped = list(state.get("skipped_existing", [])) + [str(md_path)]
+        return {**state, "skipped_existing": skipped}
+
+    exif = state.get("exif_context", {}).get(image_path.name, {"filename": image_path.name})
+    queue = list(state.get("codex_review_queue", []))
+    queue.append(build_codex_review_item(image_path, md_path, exif))
+    return {**state, "codex_review_queue": queue}
+
+
+def review_image(state: WorkflowState) -> WorkflowState:
+    if state.get("review_mode", "openai") == "codex":
+        return review_image_with_codex(state)
+    return review_image_with_openai(state)
+
+
+def write_codex_review_queue(state: WorkflowState) -> WorkflowState:
+    output_dir = Path(state["output_dir"]).resolve()
+    queue_path = output_dir / REVIEW_QUEUE_NAME
+    payload = {
+        "review_mode": "codex",
+        "image_dir": str(Path(state["image_dir"]).resolve()),
+        "metadata_dir": str(Path(state["metadata_dir"]).resolve()),
+        "output_dir": str(output_dir),
+        "instructions": [
+            "Open each image_path with Codex image viewing tools.",
+            "Write exactly one markdown file to metadata_path for each queue item.",
+            "Base metadata decisions on the original image, this item's EXIF context, and provider authorities.",
+            "Rerun this workflow with --review-mode codex after all markdown files are written.",
+        ],
+        "authority_context": {
+            "shutterstock_categories": state["authority_context"]["shutterstock_categories"],
+            "adobe_categories": state["authority_context"]["adobe_categories"],
+        },
+        "items": state.get("codex_review_queue", []),
+    }
+    queue_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {**state, "codex_review_queue_path": str(queue_path)}
+
+
 def validate_and_export(state: WorkflowState) -> WorkflowState:
     image_dir = Path(state["image_dir"]).resolve()
     metadata_dir = Path(state["metadata_dir"]).resolve()
@@ -537,7 +608,7 @@ def validate_and_export(state: WorkflowState) -> WorkflowState:
     )
     command = [
         sys.executable,
-        "generate_stock_metadata.py",
+        str(Path(__file__).resolve().parents[1] / "generate_stock_metadata.py"),
         str(image_dir),
         "--metadata-dir",
         str(metadata_dir),
@@ -553,6 +624,8 @@ def validate_and_export(state: WorkflowState) -> WorkflowState:
             str(output_dir / "shutterstock_upload_generated.csv"),
             str(output_dir / "adobe_stock_upload_generated.csv"),
             str(output_dir / "istock_metadata_generated.csv"),
+            str(output_dir / "istock_metadata_commercial_generated.csv"),
+            str(output_dir / "istock_metadata_editorial_generated.csv"),
         ],
     }
 
@@ -590,25 +663,40 @@ def build_graph():
     graph.add_node("prepare", prepare_workspace)
     graph.add_node("extract_exif", extract_exif_context)
     graph.add_node("select_next", select_next_image)
-    graph.add_node("review_image", review_image_with_openai)
+    graph.add_node("review_image", review_image)
+    graph.add_node("write_codex_queue", write_codex_review_queue)
     graph.add_node("validate_export", validate_and_export)
     graph.add_node("update_ledger", update_processed_ledger)
     graph.set_entry_point("prepare")
     graph.add_edge("prepare", "extract_exif")
     graph.add_edge("extract_exif", "select_next")
-    graph.add_conditional_edges("select_next", should_review_or_export, {"review": "review_image", "export": "validate_export"})
+    graph.add_conditional_edges(
+        "select_next",
+        should_review_or_export,
+        {"review": "review_image", "write_codex_queue": "write_codex_queue", "export": "validate_export"},
+    )
     graph.add_edge("review_image", "select_next")
+    graph.add_edge("write_codex_queue", END)
     graph.add_edge("validate_export", "update_ledger")
     graph.add_edge("update_ledger", END)
     return graph.compile()
 
 
 def parse_args(default_model: str) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the OpenAI + LangGraph stock metadata workflow.")
+    parser = argparse.ArgumentParser(description="Run the stock metadata workflow.")
     parser.add_argument("image_dir", help="Batch folder containing original images.")
     parser.add_argument("--metadata-dir", help="Markdown output folder. Defaults to image_dir.")
     parser.add_argument("--output-dir", help="CSV output folder. Defaults to image_dir.")
     parser.add_argument("--model", default=default_model)
+    parser.add_argument(
+        "--review-mode",
+        choices=["openai", "codex"],
+        default="openai",
+        help=(
+            "Use openai for API vision review, or codex to require pre-written markdown and "
+            "generate a review queue for missing files."
+        ),
+    )
     parser.add_argument("--max-images", type=int, help="Limit images for a test run.")
     parser.add_argument("--include-processed", action="store_true", help="Include images already listed in processed_photos.txt.")
     parser.add_argument("--overwrite-metadata", action="store_true")
@@ -638,6 +726,7 @@ def main() -> int:
             "metadata_dir": str(metadata_dir),
             "output_dir": str(output_dir),
             "model": args.model,
+            "review_mode": args.review_mode,
             "max_images": args.max_images,
             "include_processed": args.include_processed,
             "overwrite_metadata": args.overwrite_metadata,
@@ -649,6 +738,9 @@ def main() -> int:
     )
     print(f"metadata written: {len(final_state.get('written_markdown', []))}")
     print(f"existing metadata reused: {len(final_state.get('skipped_existing', []))}")
+    if final_state.get("codex_review_queue_path"):
+        print(f"codex review queue: {final_state['codex_review_queue_path']}")
+        print(f"codex review required: {len(final_state.get('codex_review_queue', []))}")
     for csv_path in final_state.get("exported_csvs", []):
         print(f"exported: {csv_path}")
     return 0

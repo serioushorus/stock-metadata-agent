@@ -44,6 +44,21 @@ network reverse geocoding:
 python stock_metadata_agent\workflow.py path\to\image_batch --no-reverse-geocode
 ```
 
+## Codex Review Mode
+
+Use Codex review mode when Codex should inspect images and write per-image
+markdown, while the workflow handles setup, EXIF extraction, validation, CSV
+export, and ledger updates:
+
+```powershell
+python stock_metadata_agent\workflow.py path\to\image_batch --review-mode codex --overwrite-csv
+```
+
+If markdown is missing, the workflow writes `.stock_metadata_review_queue.json`
+in the output folder and stops before export. Complete the queued visual review
+items in Codex, then rerun the same command to validate, export, and update
+`processed_photos.txt`.
+
 ## Validation And Export Only
 
 The exporter can rebuild CSVs from existing metadata markdown:

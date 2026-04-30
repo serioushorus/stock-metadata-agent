@@ -6,7 +6,6 @@ requires-python = ">=3.11"
 dependencies = [
   "openai",
   "pillow",
-  "pyinaturalist",
   "langchain",
   "langchain-openai",
   "langgraph",
