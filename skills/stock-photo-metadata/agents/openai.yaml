@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stock Photo Metadata"
+  short_description: "Generate stock photo metadata CSVs"
+  default_prompt: "Use $stock-photo-metadata to review images, write per-image metadata markdown files, and build Shutterstock and Adobe CSV uploads."
